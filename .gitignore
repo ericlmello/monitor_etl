@@ -1,0 +1,8 @@
+monitor_etl.env
+*.env
+!*.env.example
+logs/
+*.lock
+__pycache__/
+*.pyc
+.venv/
