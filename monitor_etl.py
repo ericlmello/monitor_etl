@@ -13,7 +13,7 @@ Cadeia (confirmada, so 1o grau por enquanto):
 
 staging e primarias validam contra pje_eg.tb_status_carga (Postgres), com
 as mesmas regras de ordem temporal do Java original. carga_diaria valida
-contra eg.egt_info_item (Oracle, lote 09, remessa D-1). fecha_remessa nao
+contra eg.egt_info_item (Oracle, lote 10, remessa D-1). fecha_remessa nao
 tem validacao propria -- seu papel e so fechar a remessa que carga_diaria
 ja confirmou carregada; o codigo de saida do proprio script basta.
 
@@ -29,6 +29,7 @@ Subcomandos:
     python monitor_etl.py intervir ...     registra uma intervencao humana na trilha
     python monitor_etl.py verificar        confere a integridade da trilha
     python monitor_etl.py checar_metas     alerta por e-mail se alguma meta nao for atingida
+    python monitor_etl.py relatorio        estimativas, qualidade e erros x impacto (30 dias)
 
 Agendamento: Agendador de Tarefas do Windows, opcao "nao iniciar uma nova
 instancia se ja estiver em execucao" (o arquivo de lock e uma segunda
@@ -39,6 +40,7 @@ import json
 import os
 import re
 import smtplib
+import statistics
 import subprocess
 import sys
 import threading
@@ -84,7 +86,7 @@ SCRIPT_PRIMARIAS = "tab_primarias_pje_1g.bat"
 SCRIPT_CARGA_DIARIA = "carga-diaria-D-1.bat"
 SCRIPT_FECHA_REMESSA = "fecha_remessa_diaria_D-1.bat"
 
-NUM_LOTE_REMESSA = "09"        # fixo -- confirmado, nao depende do grau
+NUM_LOTE_REMESSA = "10"        # fixo -- confirmado, nao depende do grau
 
 HORA_LIMITE_CRITICOS = 20              # staging/primarias param de tentar as 20h
 ESPERA_RETENTATIVA_CRITICO_S = 60      # 1 minuto entre tentativas dos criticos
@@ -382,24 +384,72 @@ def gravar_intervencao(registro):
     return h
 
 
-def marcar_execucao_atual(job, grau, tentativa):
+AMOSTRA_ESTIMATIVA = 30     # ultimas execucoes com sucesso usadas na estimativa
+MINIMO_ESTIMATIVA = 3       # abaixo disso nao ha base para estimar
+
+
+def estimar_duracao(job_nome):
+    """Mediana da duracao das ultimas execucoes com SUCESSO do job.
+    Retorna (segundos, n_amostras) ou (None, n) se houver poucas amostras.
+    Nunca levanta excecao: a estimativa e informativa."""
+    try:
+        with conectar_postgres() as conn, conn.cursor() as cur:
+            cur.execute(
+                """SELECT duracao_s FROM eg_monitor.execucao
+                   WHERE job = %s AND status = 'SUCESSO' AND duracao_s > 0
+                   ORDER BY id DESC LIMIT %s""", (job_nome, AMOSTRA_ESTIMATIVA))
+            valores = [float(r[0]) for r in cur.fetchall()]
+    except Exception as exc:
+        erro(f"falha ao estimar duracao de {job_nome} (nao afeta a execucao): {exc}")
+        return None, 0
+    if len(valores) < MINIMO_ESTIMATIVA:
+        return None, len(valores)
+    return statistics.median(valores), len(valores)
+
+
+def formatar_duracao(segundos):
+    if segundos is None:
+        return "sem base historica"
+    minutos = int(round(segundos / 60.0))
+    h, m = divmod(minutos, 60)
+    return f"{h}h{m:02d}min" if h else f"{m}min"
+
+
+def estimativa_restante(jobs_restantes):
+    """Soma das medianas dos jobs que ainda faltam. Se algum nao tem base,
+    devolve None (estimativa incompleta nao e mostrada como se fosse total)."""
+    total = 0.0
+    for j in jobs_restantes:
+        d, _ = estimar_duracao(j["nome"])
+        if d is None:
+            return None
+        total += d
+    return total
+
+
+def marcar_execucao_atual(job, grau, tentativa, estimada_s=None):
     """Placar de status ao vivo -- NAO faz parte da cadeia de hash da
     trilha de auditoria. Serve so para visibilidade operacional enquanto
     um job esta rodando (a tabela eg_monitor.execucao so recebe o
     registro definitivo quando o job termina)."""
+    agora = datetime.now()
     try:
         with conectar_postgres() as conn, conn.cursor() as cur:
             cur.execute(
                 """INSERT INTO eg_monitor.execucao_atual
-                       (job, grau, numero_tentativa, inicio, status, atualizado_em)
-                   VALUES (%s, %s, %s, %s, 'EM_EXECUCAO', now())
+                       (job, grau, numero_tentativa, inicio, status, atualizado_em,
+                    duracao_estimada_s, previsao_fim)
+                   VALUES (%s, %s, %s, %s, 'EM_EXECUCAO', now(), %s, %s)
                    ON CONFLICT (job) DO UPDATE SET
                        grau = EXCLUDED.grau,
                        numero_tentativa = EXCLUDED.numero_tentativa,
                        inicio = EXCLUDED.inicio,
                        status = 'EM_EXECUCAO',
-                       atualizado_em = now()""",
-                (job, grau, tentativa, datetime.now()))
+                       atualizado_em = now(),
+                       duracao_estimada_s = EXCLUDED.duracao_estimada_s,
+                       previsao_fim = EXCLUDED.previsao_fim""",
+                (job, grau, tentativa, agora, estimada_s,
+                 agora + timedelta(seconds=estimada_s) if estimada_s else None))
             conn.commit()
     except Exception as exc:
         erro(f"falha ao atualizar execucao_atual (nao afeta a trilha): {exc}")
@@ -499,7 +549,7 @@ def consultar_remessa_itens(num_remessa, num_lote):
 
 def validar_remessa_carregada(job):
     """Usada so por carga_diaria: confirma que a remessa de D-1 tem itens
-    carregados em eg.egt_info_item (lote fixo 09)."""
+    carregados em eg.egt_info_item (lote fixo 10)."""
     num_remessa = (datetime.now() - timedelta(days=1)).strftime("%Y%m%d")
     try:
         itens = consultar_remessa_itens(num_remessa, NUM_LOTE_REMESSA)
@@ -635,7 +685,10 @@ def rodar_job(job, id_execucao, cadeia):
             return "BLOQUEADO_JANELA"
 
         log(f"{job['nome']}: tentativa {tentativa}")
-        marcar_execucao_atual(job["nome"], job.get("grau"), tentativa)
+        estimada_s, n_amostras = estimar_duracao(job["nome"])
+        log(f"{job['nome']}: duracao estimada {formatar_duracao(estimada_s)}"
+            + (f" (mediana de {n_amostras} execucoes)" if estimada_s else ""))
+        marcar_execucao_atual(job["nome"], job.get("grau"), tentativa, estimada_s)
         inicio, fim, codigo, saida = executar_bat(job)
         categoria, retentavel = classificar_saida(codigo, saida)
         status = "SUCESSO" if codigo == 0 else "FALHA"
@@ -734,8 +787,19 @@ def cmd_executar():
         t = threading.Thread(target=thread_vigilancia_extracao, daemon=True)
         t.start()
 
+        total = estimativa_restante(JOBS)
+        if total is None:
+            log("estimativa do ciclo: sem base historica suficiente em algum job")
+        else:
+            log(f"estimativa do ciclo completo: {formatar_duracao(total)} "
+                f"(previsao de termino {datetime.now() + timedelta(seconds=total):%H:%M})")
+
         cadeia = {}
-        for job in JOBS:
+        for indice, job in enumerate(JOBS):
+            if indice > 0:
+                restante = estimativa_restante(JOBS[indice:])
+                if restante is not None:
+                    log(f"falta estimado para concluir a cadeia: {formatar_duracao(restante)}")
             status = rodar_job(job, id_execucao, cadeia)
             cadeia[job["nome"]] = status
             if job.get("critico") and status != "SUCESSO":
@@ -824,7 +888,46 @@ def cmd_checar_metas():
     return 1
 
 
+def _consultar_view(sql):
+    with conectar_postgres() as conn, conn.cursor() as cur:
+        cur.execute(sql)
+        cols = [d.name for d in cur.description]
+        return cols, cur.fetchall()
+
+
+def _imprimir_tabela(titulo, cols, linhas):
+    print(f"\n== {titulo} ==")
+    if not linhas:
+        print("(sem dados)")
+        return
+    texto = [[("" if v is None else str(v)) for v in l] for l in linhas]
+    larguras = [max(len(c), *(len(l[i]) for l in texto)) for i, c in enumerate(cols)]
+    print("  ".join(c.ljust(larguras[i]) for i, c in enumerate(cols)))
+    for l in texto:
+        print("  ".join(v.ljust(larguras[i]) for i, v in enumerate(l)))
+
+
+def cmd_relatorio():
+    """Estimativa de duracao por job, qualidade e frequencia de erros x impacto
+    (ultimos 30 dias). Le as views eg_monitor.vw_qualidade_job e vw_erro_impacto
+    (criadas por sql/002)."""
+    print("== Duracao estimada por job (mediana das ultimas execucoes com sucesso) ==")
+    for j in JOBS:
+        d, n = estimar_duracao(j["nome"])
+        print(f"{j['nome']:<15} {formatar_duracao(d)}" + (f"  (n={n})" if d else f"  (n={n})"))
+    for titulo, view in (("Qualidade por job (30 dias)", "vw_qualidade_job"),
+                         ("Frequencia de erros x impacto (30 dias)", "vw_erro_impacto")):
+        try:
+            cols, linhas = _consultar_view(f"SELECT * FROM eg_monitor.{view}")
+            _imprimir_tabela(titulo, cols, linhas)
+        except Exception as exc:
+            print(f"\n{titulo}: indisponivel ({exc}). Rode sql/002 no DBeaver.", file=sys.stderr)
+    return 0
+
+
 def main():
+    if len(sys.argv) > 1 and sys.argv[1] == "relatorio":
+        return cmd_relatorio()
     if len(sys.argv) > 1 and sys.argv[1] in ("intervir", "verificar", "checar_metas"):
         comando = sys.argv[1]
         if comando == "intervir":

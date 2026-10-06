@@ -98,3 +98,20 @@ def test_senha_ausente_falha_claro(monkeypatch):
         assert False
     except RuntimeError as e:
         assert "POSTGRES_PASSWORD" in str(e)
+
+
+def test_lote_remessa_e_10():
+    assert m.NUM_LOTE_REMESSA == "10"
+
+
+def test_formatar_duracao():
+    assert m.formatar_duracao(None) == "sem base historica"
+    assert m.formatar_duracao(45 * 60) == "45min"
+    assert m.formatar_duracao(3600 + 5 * 60) == "1h05min"
+
+
+def test_estimativa_restante_soma_e_incompleta(monkeypatch):
+    medias = {"a": (600.0, 5), "b": (1200.0, 5), "c": (None, 1)}
+    monkeypatch.setattr(m, "estimar_duracao", lambda n: medias[n])
+    assert m.estimativa_restante([{"nome": "a"}, {"nome": "b"}]) == 1800.0
+    assert m.estimativa_restante([{"nome": "a"}, {"nome": "c"}]) is None

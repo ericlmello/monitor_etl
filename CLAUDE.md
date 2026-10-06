@@ -12,7 +12,7 @@ Watchdog em um unico arquivo Python (`monitor_etl.py`) que dispara os jobs Penta
 - Texto em portugues do Brasil, sem travessoes nem estilo de IA.
 
 ## Cadeia (so 1o grau)
-staging -> primarias -> carga_diaria -> fecha_remessa. Lote fixo `09`, remessa D-1 (AAAAMMDD).
+staging -> primarias -> carga_diaria -> fecha_remessa. Lote fixo `10`, remessa D-1 (AAAAMMDD).
 - staging e primarias: criticas, retentam a cada 60 s ate 20h (HORA_LIMITE_CRITICOS); validam em `pje_eg.tb_status_carga` (somente leitura).
 - carga_diaria: 5 tentativas, backoff [60,300,600] s; valida `eg.egt_info_item` (Oracle).
 - fecha_remessa: 5 tentativas; valida so o codigo de saida.
@@ -22,8 +22,11 @@ staging -> primarias -> carga_diaria -> fecha_remessa. Lote fixo `09`, remessa D
 Tabelas: `execucao` (1 linha por tentativa, hash encadeado), `intervencao` (acao humana, motivo >= 20 chars), `meta`, `execucao_atual` (placar ao vivo, FORA da cadeia). Views: vw_indicador_vs_meta, vw_saude, etc.
 Hash: `duracao_s` com 3 casas; CHAR com `rstrip()`. A ancora (12 primeiros caracteres do hash final de `verificar`) deve ser guardada fora do banco. Duracao/MTTR comparados ao historico por mediana/MAD (2xMAD, minimo 10 amostras).
 
+## Estimativa, qualidade e impacto
+Estimativa = mediana das ultimas 30 execucoes com SUCESSO do job (minimo 3). Gravada em `execucao_atual` (duracao_estimada_s, previsao_fim) e logada. Views `vw_qualidade_job` e `vw_erro_impacto` em sql/002; `relatorio` as imprime.
+
 ## Subcomandos
-`py -3.8 monitor_etl.py` | `intervir` | `verificar` | `checar_metas`
+`py -3.8 monitor_etl.py` | `intervir` | `verificar` | `checar_metas` | `relatorio`
 
 ## Pendencias de implantacao (lado do usuario)
 Criar `execucao_atual` (sql/001), trocar o script em producao, testar timeout, registrar uma intervencao de teste, rodar `verificar` e guardar a ancora, agendar as duas tarefas no Windows, desativar a tarefa do JAR legado. Trocar as senhas do Postgres e do Oracle (estiveram no codigo).
