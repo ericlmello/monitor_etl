@@ -474,16 +474,16 @@ def listar_execucao():
 
 
 def listar_indicador_vs_meta():
-    """Le eg_monitor.vw_indicador_vs_meta: taxa_sucesso_pct comparada com a
-    meta cadastrada, duracao/MTTR comparados com o padrao historico
-    (variancia direta, sem gravar nada). SEM_META e SEM_HISTORICO nao sao
-    quebra, so ausencia de base para comparar -- ficam de fora daqui."""
+    """Le eg_monitor.vw_indicador_vs_meta: cada indicador (taxa_sucesso_pct,
+    duracao_media_min, mttr_medio_min) comparado com a meta cadastrada em
+    eg_monitor.meta (valor_meta + operador). SEM_META nao e quebra, so
+    ausencia de meta -- fica de fora daqui."""
     with conectar_postgres() as conn, conn.cursor() as cur:
         cur.execute(
-            """SELECT job, etapa_macroprocesso, indicador, valor, referencia,
-                      descricao, status_meta
+            """SELECT job, etapa_macroprocesso, indicador, valor, valor_meta,
+                      operador, descricao, status_meta
                FROM eg_monitor.vw_indicador_vs_meta
-               WHERE status_meta NOT IN ('SEM_META', 'SEM_HISTORICO')
+               WHERE status_meta <> 'SEM_META'
                ORDER BY job, indicador""")
         cols = [d.name for d in cur.description]
         return [dict(zip(cols, linha)) for linha in cur.fetchall()]
@@ -867,18 +867,19 @@ def cmd_verificar():
 
 
 def cmd_checar_metas():
-    """taxa_sucesso_pct: quebra = NAO_ATINGIU (meta fixa em eg_monitor.meta).
-    duracao/MTTR: quebra = FORA_DO_PADRAO (desvio da mediana historica maior
-    que 2x o MAD -- ver eg_monitor.vw_indicador_vs_meta)."""
+    """Quebra = status_meta NAO_ATINGIU em eg_monitor.vw_indicador_vs_meta
+    (valor atual contra valor_meta com o operador >= ou <= da tabela meta).
+    As metas de duracao/MTTR podem ser calibradas pela mediana + 2xMAD
+    sugerida em eg_monitor.vw_meta_sugerida (minimo 10 amostras)."""
     configurar_log()
     quebras = [l for l in listar_indicador_vs_meta()
-              if l.get("status_meta") in ("NAO_ATINGIU", "FORA_DO_PADRAO")]
+              if l.get("status_meta") == "NAO_ATINGIU"]
     if not quebras:
         log("checar_metas: nada fora do esperado (ou sem base para comparar ainda)")
         return 0
     linhas_corpo = [
         f"{l['job']} ({l['etapa_macroprocesso']}) -- {l['indicador']}: valor atual {l['valor']}, "
-        f"referencia {l['referencia']} [{l['status_meta']}]"
+        f"meta {l['operador']} {l['valor_meta']} [{l['status_meta']}]"
         + (f" -- {l['descricao']}" if l.get("descricao") else "")
         for l in quebras
     ]

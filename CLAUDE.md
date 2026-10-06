@@ -19,8 +19,8 @@ staging -> primarias -> carga_diaria -> fecha_remessa. Lote fixo `10`, remessa D
 - So falhas transitorias/desconhecidas/timeout/validacao sao retentadas. Timeout mata a arvore Java.
 
 ## Banco (dw_trt, schema eg_monitor)
-Tabelas: `execucao` (1 linha por tentativa, hash encadeado), `intervencao` (acao humana, motivo >= 20 chars), `meta`, `execucao_atual` (placar ao vivo, FORA da cadeia). Views: vw_indicador_vs_meta, vw_saude, etc.
-Hash: `duracao_s` com 3 casas; CHAR com `rstrip()`. A ancora (12 primeiros caracteres do hash final de `verificar`) deve ser guardada fora do banco. Duracao/MTTR comparados ao historico por mediana/MAD (2xMAD, minimo 10 amostras).
+Tabelas: `execucao` (1 linha por tentativa, hash encadeado), `intervencao` (acao humana, motivo >= 20 chars), `meta`, `execucao_atual` (placar ao vivo, FORA da cadeia). Views (DDL em sql/000): vw_macroprocesso, vw_recuperacao, vw_indicador_diario, vw_indicador_30d, vw_indicador_valor, vw_amostra_historica, vw_indicador_vs_meta, vw_meta_sugerida, vw_saude.
+Hash: `duracao_s` com 3 casas; CHAR com `rstrip()`. A ancora (12 primeiros caracteres do hash final de `verificar`) deve ser guardada fora do banco. `checar_metas` alerta quando `vw_indicador_vs_meta` da NAO_ATINGIU (valor_meta + operador de `meta`). `vw_meta_sugerida` propoe metas de duracao/MTTR por mediana + 2xMAD (minimo 10 amostras; a taxa de sucesso fica de fora).
 
 ## Estimativa, qualidade e impacto
 Estimativa = mediana das ultimas 30 execucoes com SUCESSO do job (minimo 3). Gravada em `execucao_atual` (duracao_estimada_s, previsao_fim) e logada. Views `vw_qualidade_job` e `vw_erro_impacto` em sql/002; `relatorio` as imprime.
