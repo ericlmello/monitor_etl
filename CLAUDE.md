@@ -6,7 +6,7 @@ Watchdog em um unico arquivo Python (`monitor_etl.py`) que dispara os jobs Penta
 - Um unico script Python. Nao dividir em modulos.
 - Producao: Windows Server 2008 R2, Python 3.8 (ao lado do 2.7.18). Manter compatibilidade 3.8 (sem `match`, sem `X | Y` em tipos).
 - Oracle 19c: modo thin falha (cryptography>=43, DPY-3016) e Instant Client 19c nao carrega (GetOverlappedResultEx). Usa-se thick com Instant Client 11.2 em `C:\oracle\instantclient_11_2` (init preguicoso).
-- Credenciais nunca no codigo/git: variaveis de ambiente ou `C:\etl_monitor\monitor_etl.env`.
+- Credenciais: constantes no inicio do `monitor_etl.py`, preenchidas so no servidor (decisao do usuario, sem .env). No git ficam como placeholder `COLE_A_SENHA_AQUI`; nunca commitar a senha real.
 - Consultas ao banco que o usuario deve rodar vao como SQL para o DBeaver.
 - Este ambiente (nuvem) nao alcanca Postgres/Oracle internos: aqui so se edita e roda `pytest testes`.
 - Texto em portugues do Brasil, sem travessoes nem estilo de IA.

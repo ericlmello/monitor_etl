@@ -4,7 +4,7 @@ Watchdog PAI em Python 3.8 para os jobs Pentaho de carga do e-Gestao (staging, t
 
 ## Instalacao no servidor
 1. `py -3.8 -m pip install -r requirements.txt`
-2. Copie `monitor_etl.env.example` para `C:\etl_monitor\monitor_etl.env` e preencha as senhas.
+2. Edite `POSTGRES_PASSWORD` e `ORACLE_PASSWORD` no inicio do `monitor_etl.py` (no repositorio estao como placeholder).
 3. Rode `sql/001_schema_eg_monitor.sql` no DBeaver.
 4. Instant Client 11.2 em `C:\oracle\instantclient_11_2`.
 
@@ -19,4 +19,4 @@ Watchdog PAI em Python 3.8 para os jobs Pentaho de carga do e-Gestao (staging, t
     python -m pytest testes
 
 ## Seguranca
-As senhas que ficavam no codigo foram retiradas. Troque as do Postgres e do Oracle, pois constam no historico de versoes anterior a este repositorio.
+No repositorio as senhas sao placeholder. Preencha so a copia do servidor e nao faca commit dela. Troque as senhas antigas do Postgres e do Oracle.

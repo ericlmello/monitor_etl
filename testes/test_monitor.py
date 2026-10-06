@@ -92,7 +92,7 @@ def test_intervir_exige_motivo_longo():
 
 
 def test_senha_ausente_falha_claro(monkeypatch):
-    monkeypatch.setattr(m, "POSTGRES_PASSWORD", None)
+    monkeypatch.setattr(m, "POSTGRES_PASSWORD", m.SENHA_PLACEHOLDER)
     try:
         m.conectar_postgres()
         assert False

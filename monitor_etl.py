@@ -21,8 +21,8 @@ staging/primarias sao criticas: tentam indefinidamente, a cada 1 minuto,
 ate serem validadas ou ate o horario-limite (HORA_LIMITE_CRITICOS).
 carga_diaria/fecha_remessa tem retentativa limitada com alerta por e-mail.
 
-Credenciais NAO ficam no codigo: vem de variaveis de ambiente ou do arquivo
-C:/etl_monitor/monitor_etl.env (fora do git; modelo em monitor_etl.env.example).
+Credenciais ficam nas constantes POSTGRES_*/ORACLE_* abaixo, preenchidas
+direto no servidor. No git o valor e um placeholder (nunca commitar a senha).
 
 Subcomandos:
     python monitor_etl.py                 executa a cadeia completa (uso normal, 1x/dia)
@@ -63,39 +63,21 @@ SCRIPTS_DIR = Path(r"C:\pdi8\scripts")
 LOG_DIR = BASE_DIR / "logs"
 LOCK_FILE = BASE_DIR / "monitor_etl.lock"
 
-def _carregar_env_arquivo(caminho):
-    """Le linhas CHAVE=VALOR (sem dependencias). Variaveis de ambiente ja
-    definidas tem precedencia sobre o arquivo."""
-    try:
-        with open(caminho, encoding="utf-8") as f:
-            for linha in f:
-                linha = linha.strip()
-                if not linha or linha.startswith("#") or "=" not in linha:
-                    continue
-                chave, valor = linha.split("=", 1)
-                os.environ.setdefault(chave.strip(), valor.strip().strip('"').strip("'"))
-    except FileNotFoundError:
-        pass
+# Credenciais: edite os dois valores SENHA abaixo direto no servidor.
+# No repositorio ficam como placeholder; nao faca commit com a senha real.
+SENHA_PLACEHOLDER = "COLE_A_SENHA_AQUI"
 
-
-_carregar_env_arquivo(os.environ.get("MONITOR_ETL_ENV", str(BASE_DIR / "monitor_etl.env")))
-
-
-def _env(chave, padrao=None):
-    return os.environ.get(chave, padrao)
-
-
-POSTGRES_HOST = _env("POSTGRES_HOST", "10.2.2.66")
-POSTGRES_PORT = _env("POSTGRES_PORT", "1036")
-POSTGRES_DBNAME = _env("POSTGRES_DBNAME", "dw_trt")
-POSTGRES_USER = _env("POSTGRES_USER", "app_dw_trt")
-POSTGRES_PASSWORD = _env("POSTGRES_PASSWORD")
+POSTGRES_HOST = "10.2.2.66"
+POSTGRES_PORT = "1036"
+POSTGRES_DBNAME = "dw_trt"
+POSTGRES_USER = "app_dw_trt"
+POSTGRES_PASSWORD = SENHA_PLACEHOLDER
 
 ORACLE_HOST = "clusteroracle.trtsp.jus.br"
 ORACLE_PORT = "11521"
 ORACLE_SERVICE_NAME = "egestao.trtsp.jus.br"
-ORACLE_USER = _env("ORACLE_USER", "eg")
-ORACLE_PASSWORD = _env("ORACLE_PASSWORD")
+ORACLE_USER = "eg"
+ORACLE_PASSWORD = SENHA_PLACEHOLDER
 
 SCRIPT_STAGING = "staging_pje_1g.bat"
 SCRIPT_PRIMARIAS = "tab_primarias_pje_1g.bat"
@@ -175,8 +157,8 @@ _lock_processo = threading.Lock()
 # CONEXOES
 # =============================================================================
 def _exigir_senha(valor, nome):
-    if not valor:
-        raise RuntimeError(f"{nome} nao definida (variavel de ambiente ou monitor_etl.env)")
+    if not valor or valor == SENHA_PLACEHOLDER:
+        raise RuntimeError(f"{nome} nao preenchida: edite a constante no inicio do monitor_etl.py")
     return valor
 
 
