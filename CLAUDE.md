@@ -28,8 +28,11 @@ Estimativa = mediana das ultimas 30 execucoes com SUCESSO do job (minimo 3). Gra
 ## Sazonalidade, tendencia e previsao
 sql/003: `vw_qualidade_diaria`, `vw_qualidade_faixa_mes` (inicio/meio/fim do mes), `vw_tendencia_qualidade` (regressao linear de 60 dias; SEM_BASE com menos de 10 dias). Previsao simples, nao e modelo de ML.
 
+## Painel em tempo real
+`painel [--porta 8080] [--host 127.0.0.1]`: servidor HTTP (stdlib) somente leitura com grafo da cadeia, linha do tempo das tentativas e grade de 14 dias. Le `execucao_atual` e `execucao`; atualiza a cada 5 s. Sem autenticacao: por padrao so aceita a propria maquina. `montar_estado` e funcao pura e testada.
+
 ## Subcomandos
-`py -3.8 monitor_etl.py` | `intervir` | `verificar` | `checar_metas` | `relatorio`
+`py -3.8 monitor_etl.py` | `intervir` | `verificar` | `checar_metas` | `relatorio` | `painel`
 
 ## Pendencias de implantacao (lado do usuario)
 Criar `execucao_atual` (sql/001), trocar o script em producao, testar timeout, registrar uma intervencao de teste, rodar `verificar` e guardar a ancora, agendar as duas tarefas no Windows, desativar a tarefa do JAR legado. Trocar as senhas do Postgres e do Oracle (estiveram no codigo).

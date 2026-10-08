@@ -30,6 +30,7 @@ Subcomandos:
     python monitor_etl.py verificar        confere a integridade da trilha
     python monitor_etl.py checar_metas     alerta por e-mail se alguma meta nao for atingida
     python monitor_etl.py relatorio        estimativas, qualidade e erros x impacto (30 dias)
+    python monitor_etl.py painel           grafo da cadeia em tempo real (http://127.0.0.1:8080)
 
 Agendamento: Agendador de Tarefas do Windows, opcao "nao iniciar uma nova
 instancia se ja estiver em execucao" (o arquivo de lock e uma segunda
@@ -928,9 +929,343 @@ def cmd_relatorio():
     return 0
 
 
+# =============================================================================
+# PAINEL (grafo da cadeia em tempo real) -- somente leitura
+# =============================================================================
+ETAPAS = {
+    "staging": "Staging",
+    "primarias": "Tabelas primárias",
+    "carga_diaria": "Remessa diária",
+    "fecha_remessa": "Fechamento",
+}
+PAINEL_ATUALIZA_S = 5
+_cache_estimativas = {"quando": 0.0, "valores": {}}
+_cache_estado = {"quando": 0.0, "valor": None}
+_lock_cache = threading.Lock()
+
+
+def _iso(v):
+    return v.strftime("%Y-%m-%dT%H:%M:%S") if isinstance(v, datetime) else None
+
+
+def montar_estado(agora, em_execucao, tentativas, historico, estimativas):
+    """Monta o estado do painel a partir de dados ja lidos (funcao pura, sem
+    banco, para poder ser testada). em_execucao: {job: {inicio, tentativa,
+    estimada_s}}; tentativas: lista (ordem cronologica) de dicts do ciclo do
+    dia; historico: lista de (dia, job, ok); estimativas: {job: segundos|None}."""
+    nos = []
+    montante_restante = 0.0
+    restante_conhecido = True
+    parou_a_montante = False
+    for indice, job in enumerate(JOBS):
+        nome = job["nome"]
+        tent = [t for t in tentativas if t["job"] == nome]
+        rodando = em_execucao.get(nome)
+        estimada = (rodando or {}).get("estimada_s") or estimativas.get(nome)
+        no = {
+            "job": nome, "etapa": ETAPAS.get(nome, nome), "ordem": indice + 1,
+            "critico": bool(job.get("critico")), "tentativas": len(tent),
+            "estimada_s": estimada, "decorrido_s": None, "restante_s": None,
+            "progresso_pct": None, "inicio": None, "fim": None,
+            "duracao_s": None, "categoria_erro": None, "mensagem": None,
+        }
+        if rodando:
+            ultima = tent[-1] if tent else None
+            aguardando = bool(ultima and ultima["fim"] and ultima["fim"] >= rodando["inicio"])
+            no["estado"] = "AGUARDANDO_RETENTATIVA" if aguardando else "EM_EXECUCAO"
+            no["tentativa_atual"] = rodando["tentativa"]
+            no["inicio"] = _iso(rodando["inicio"])
+            if not aguardando:
+                decorrido = max(0.0, (agora - rodando["inicio"]).total_seconds())
+                no["decorrido_s"] = decorrido
+                if estimada:
+                    no["progresso_pct"] = round(min(99.0, 100.0 * decorrido / estimada), 1)
+                    no["restante_s"] = max(0.0, estimada - decorrido)
+                    montante_restante += no["restante_s"]
+                else:
+                    restante_conhecido = False
+            else:
+                if estimada:
+                    montante_restante += estimada
+                else:
+                    restante_conhecido = False
+            if ultima:
+                no["categoria_erro"] = ultima.get("categoria_erro")
+                no["mensagem"] = ultima.get("mensagem")
+        elif tent:
+            ultima = tent[-1]
+            no["estado"] = {"SUCESSO": "SUCESSO", "FALHA": "FALHA",
+                            "BLOQUEADO_JANELA": "BLOQUEADO"}.get(ultima["status"], ultima["status"])
+            no["inicio"], no["fim"] = _iso(ultima["inicio"]), _iso(ultima["fim"])
+            no["duracao_s"] = ultima.get("duracao_s")
+            no["categoria_erro"] = ultima.get("categoria_erro")
+            no["mensagem"] = ultima.get("mensagem")
+            if no["estado"] in ("FALHA", "BLOQUEADO") and job.get("critico"):
+                parou_a_montante = True
+        else:
+            if parou_a_montante:
+                no["estado"] = "NAO_EXECUTADO"
+            else:
+                no["estado"] = "PENDENTE"
+                if estimada:
+                    montante_restante += estimada
+                else:
+                    restante_conhecido = False
+        nos.append(no)
+
+    ativos = [n for n in nos if n["estado"] in ("EM_EXECUCAO", "AGUARDANDO_RETENTATIVA")]
+    pendentes = [n for n in nos if n["estado"] == "PENDENTE"]
+    restante = montante_restante if restante_conhecido else None
+    resumo = {"restante_s": restante,
+              "previsao_fim": _iso(agora + timedelta(seconds=restante)) if (restante is not None and (ativos or pendentes)) else None,
+              "concluido": all(n["estado"] == "SUCESSO" for n in nos)}
+    barras = []
+    for t in tentativas:
+        barras.append({"job": t["job"], "tentativa": t["tentativa"], "status": t["status"],
+                       "inicio": _iso(t["inicio"]), "fim": _iso(t["fim"]),
+                       "aberta": False})
+    for nome, r in em_execucao.items():
+        barras.append({"job": nome, "tentativa": r["tentativa"], "status": "EM_EXECUCAO",
+                       "inicio": _iso(r["inicio"]), "fim": _iso(agora), "aberta": True})
+    return {"agora": _iso(agora), "dia": agora.strftime("%Y-%m-%d"),
+            "nos": nos, "resumo": resumo, "barras": barras,
+            "historico": [{"dia": str(d), "job": j, "ok": bool(ok)} for d, j, ok in historico]}
+
+
+def _estimativas_com_cache():
+    agora = time.time()
+    with _lock_cache:
+        if agora - _cache_estimativas["quando"] < 60 and _cache_estimativas["valores"]:
+            return dict(_cache_estimativas["valores"])
+    valores = {}
+    for j in JOBS:
+        d, _ = estimar_duracao(j["nome"])
+        valores[j["nome"]] = d
+    with _lock_cache:
+        _cache_estimativas.update(quando=agora, valores=dict(valores))
+    return valores
+
+
+def coletar_estado():
+    agora = datetime.now()
+    with conectar_postgres() as conn, conn.cursor() as cur:
+        try:
+            cur.execute("""SELECT job, numero_tentativa, inicio, duracao_estimada_s
+                           FROM eg_monitor.execucao_atual""")
+            linhas = cur.fetchall()
+        except Exception:
+            conn.rollback()
+            cur.execute("SELECT job, numero_tentativa, inicio, NULL FROM eg_monitor.execucao_atual")
+            linhas = cur.fetchall()
+        em_execucao = {j: {"tentativa": t, "inicio": i,
+                           "estimada_s": float(e) if e is not None else None}
+                       for j, t, i, e in linhas}
+        if em_execucao:
+            dia = min(r["inicio"] for r in em_execucao.values()).date()
+        else:
+            cur.execute("SELECT max(inicio)::date FROM eg_monitor.execucao")
+            dia = cur.fetchone()[0] or agora.date()
+        cur.execute("""SELECT id_execucao, job, numero_tentativa, inicio, fim, duracao_s,
+                              status, categoria_erro, mensagem_erro_limpa
+                       FROM eg_monitor.execucao WHERE inicio::date = %s
+                       ORDER BY inicio, id""", (dia,))
+        brutas = cur.fetchall()
+        cur.execute("""SELECT inicio::date AS dia, job, bool_or(status = 'SUCESSO') AS ok
+                       FROM eg_monitor.execucao
+                       WHERE inicio >= current_date - 13
+                       GROUP BY 1, 2 ORDER BY 1, 2""")
+        historico = cur.fetchall()
+    ultimo_ciclo = brutas[-1][0] if brutas else None
+    tentativas = [{"job": r[1], "tentativa": r[2], "inicio": r[3], "fim": r[4],
+                   "duracao_s": float(r[5]) if r[5] is not None else None,
+                   "status": r[6], "categoria_erro": r[7], "mensagem": r[8]}
+                  for r in brutas if r[0] == ultimo_ciclo]
+    estado = montar_estado(agora, em_execucao, tentativas, historico, _estimativas_com_cache())
+    estado["dia"] = str(dia)
+    return estado
+
+
+def estado_cacheado():
+    agora = time.time()
+    with _lock_cache:
+        if _cache_estado["valor"] is not None and agora - _cache_estado["quando"] < 3:
+            return _cache_estado["valor"]
+    valor = coletar_estado()
+    with _lock_cache:
+        _cache_estado.update(quando=agora, valor=valor)
+    return valor
+
+
+PAINEL_HTML = r"""<!doctype html>
+<html lang="pt-BR"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Monitor ETL</title>
+<style>
+:root{--bg:#f6f8fa;--card:#fff;--tx:#1f2328;--mut:#59636e;--bd:#d1d9e0;
+--ok:#1a7f37;--run:#0969da;--fail:#cf222e;--wait:#8250df;--warn:#9a6700;--pend:#8c959f}
+@media (prefers-color-scheme:dark){:root{--bg:#0d1117;--card:#161b22;--tx:#e6edf3;--mut:#9198a1;--bd:#30363d;
+--ok:#3fb950;--run:#58a6ff;--fail:#f85149;--wait:#bc8cff;--warn:#d29922;--pend:#6e7681}}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--tx);font:14px/1.45 system-ui,Segoe UI,Arial,sans-serif}
+header{display:flex;flex-wrap:wrap;gap:8px 24px;align-items:baseline;padding:14px 16px;border-bottom:1px solid var(--bd);background:var(--card)}
+h1{font-size:18px;margin:0}h2{font-size:14px;margin:0 0 8px;color:var(--mut);font-weight:600}
+main{max-width:1040px;margin:0 auto;padding:16px}
+.card{background:var(--card);border:1px solid var(--bd);border-radius:8px;padding:14px;margin-bottom:16px}
+.mut{color:var(--mut)}#aviso{display:none;margin-bottom:12px;padding:8px 12px;border-radius:6px;background:var(--fail);color:#fff}
+svg{display:block;width:100%;height:auto}
+.nome{font-weight:600;font-size:14px;fill:var(--tx)}.sub{font-size:12px;fill:var(--mut)}.est{font-size:12px;font-weight:600}
+.pulsa{animation:p 1.4s ease-in-out infinite}@keyframes p{50%{stroke-opacity:.25}}
+@media (prefers-reduced-motion:reduce){.pulsa{animation:none}}
+table{border-collapse:collapse;width:100%;font-size:12px}td,th{padding:3px 4px;text-align:center}
+th{color:var(--mut);font-weight:500}td.job,th.job{text-align:left;white-space:nowrap;padding-right:10px}
+td.c{border:2px solid var(--card);border-radius:4px;color:#fff;font-weight:700;min-width:22px}
+.leg span{margin-right:14px;white-space:nowrap}.leg i{display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:4px}
+</style></head><body>
+<header><h1>Monitor ETL</h1><span id="dia" class="mut"></span><span id="resumo"></span>
+<span id="atual" class="mut" style="margin-left:auto"></span></header>
+<main>
+<div id="aviso"></div>
+<div class="card"><h2>Cadeia do dia</h2><svg id="dag" viewBox="0 0 960 190" role="img" aria-label="Grafo da cadeia de jobs"></svg></div>
+<div class="card"><h2>Linha do tempo das tentativas</h2><svg id="gantt" viewBox="0 0 960 190" role="img" aria-label="Linha do tempo"></svg></div>
+<div class="card"><h2>Últimos 14 dias</h2><div id="grade"></div></div>
+<div class="leg mut" id="leg"></div>
+</main>
+<script>
+var COR={SUCESSO:'var(--ok)',EM_EXECUCAO:'var(--run)',AGUARDANDO_RETENTATIVA:'var(--wait)',FALHA:'var(--fail)',BLOQUEADO:'var(--warn)',BLOQUEADO_JANELA:'var(--warn)',PENDENTE:'var(--pend)',NAO_EXECUTADO:'var(--pend)'};
+var ROT={SUCESSO:'Concluído',EM_EXECUCAO:'Em execução',AGUARDANDO_RETENTATIVA:'Aguardando nova tentativa',FALHA:'Falhou',BLOQUEADO:'Bloqueado pelo horário',BLOQUEADO_JANELA:'Bloqueado pelo horário',PENDENTE:'Pendente',NAO_EXECUTADO:'Não executado'};
+var NS='http://www.w3.org/2000/svg';
+function el(t,a,txt){var e=document.createElementNS(NS,t);for(var k in a){e.setAttribute(k,a[k])}if(txt!==undefined){e.textContent=txt}return e}
+function limpa(n){while(n.firstChild){n.removeChild(n.firstChild)}}
+function ep(s){var m=/^(\d+)-(\d+)-(\d+)T(\d+):(\d+):(\d+)/.exec(s||'');return m?Date.UTC(+m[1],m[2]-1,+m[3],+m[4],+m[5],+m[6])/1000:null}
+function dur(s){if(s===null||s===undefined){return '-'}s=Math.round(s);var h=Math.floor(s/3600),m=Math.floor(s%3600/60),x=s%60;
+ return h?h+'h'+('0'+m).slice(-2)+'min':(m?m+'min'+(x?(' '+x+'s'):''):x+'s')}
+function hm(t){var d=new Date(t*1000);return ('0'+d.getUTCHours()).slice(-2)+':'+('0'+d.getUTCMinutes()).slice(-2)}
+function desenhaDag(nos){var g=document.getElementById('dag');limpa(g);
+ var df=el('defs',{});var mk=el('marker',{id:'ar',viewBox:'0 0 10 10',refX:'9',refY:'5',markerWidth:'7',markerHeight:'7',orient:'auto'});
+ mk.appendChild(el('path',{d:'M0,0 L10,5 L0,10 z',fill:'var(--mut)'}));df.appendChild(mk);g.appendChild(df);
+ var W=200,H=150,GAP=44,X0=12,Y=18;
+ for(var i=0;i<nos.length;i++){var n=nos[i],x=X0+i*(W+GAP),c=COR[n.estado]||'var(--pend)';
+  if(i>0){g.appendChild(el('line',{x1:x-GAP+2,y1:Y+H/2,x2:x-3,y2:Y+H/2,stroke:'var(--mut)','stroke-width':2,'marker-end':'url(#ar)'}))}
+  var ativo=(n.estado==='EM_EXECUCAO'||n.estado==='AGUARDANDO_RETENTATIVA');
+  g.appendChild(el('rect',{x:x,y:Y,width:W,height:H,rx:8,fill:'var(--card)',stroke:c,'stroke-width':ativo?3:2,'class':ativo?'pulsa':''}));
+  g.appendChild(el('rect',{x:x,y:Y,width:6,height:H,rx:3,fill:c}));
+  g.appendChild(el('text',{x:x+16,y:Y+24,'class':'nome'},n.ordem+'. '+n.etapa));
+  g.appendChild(el('text',{x:x+16,y:Y+42,'class':'sub'},n.job+(n.critico?' (crítico)':'')));
+  g.appendChild(el('text',{x:x+16,y:Y+66,'class':'est',fill:c},ROT[n.estado]||n.estado));
+  var l1='',l2='';
+  if(n.estado==='EM_EXECUCAO'){l1='Decorrido '+dur(n.decorrido_s)+(n.estimada_s?' de ~'+dur(n.estimada_s):'');l2=n.restante_s!==null?'Faltam ~'+dur(n.restante_s):'Sem estimativa ainda'}
+  else if(n.estado==='AGUARDANDO_RETENTATIVA'){l1='Tentativa '+n.tentativa_atual+' em seguida';l2=(n.categoria_erro?('Último erro: '+n.categoria_erro):'')}
+  else if(n.estado==='SUCESSO'){l1='Duração '+dur(n.duracao_s);l2='Fim '+hm(ep(n.fim))}
+  else if(n.estado==='FALHA'||n.estado==='BLOQUEADO'){l1=(n.categoria_erro||'Sem categoria')+' após '+n.tentativas+' tentativa(s)';l2='Fim '+hm(ep(n.fim))}
+  else if(n.estimada_s){l1='Estimado ~'+dur(n.estimada_s)}
+  g.appendChild(el('text',{x:x+16,y:Y+88,'class':'sub'},l1));g.appendChild(el('text',{x:x+16,y:Y+106,'class':'sub'},l2));
+  if(n.tentativas>0&&n.estado!=='SUCESSO'||n.tentativas>1){g.appendChild(el('text',{x:x+16,y:Y+H-10,'class':'sub'},'Tentativas registradas: '+n.tentativas))}
+  if(n.progresso_pct!==null){g.appendChild(el('rect',{x:x+16,y:Y+H-26,width:W-32,height:7,rx:3,fill:'var(--bd)'}));
+   g.appendChild(el('rect',{x:x+16,y:Y+H-26,width:(W-32)*n.progresso_pct/100,height:7,rx:3,fill:c}));}
+  if(n.mensagem){var t=el('title',{},n.mensagem);g.lastChild.appendChild(t)}
+ }}
+function desenhaGantt(barras,agora,nos){var g=document.getElementById('gantt');limpa(g);
+ var jobs=[];for(var i=0;i<nos.length;i++){jobs.push(nos[i].job)}
+ var rows=jobs.length,LH=34,L=110,R=20,T=8,Wd=960-L-R,H=T+rows*LH+28;g.setAttribute('viewBox','0 0 960 '+H);
+ if(!barras.length){g.appendChild(el('text',{x:L,y:60,'class':'sub'},'Nenhuma tentativa registrada neste dia ainda.'));return}
+ var a=ep(agora),mn=a,mx=a;for(var b=0;b<barras.length;b++){var s=ep(barras[b].inicio),f=ep(barras[b].fim);if(s<mn){mn=s}if(f>mx){mx=f}}
+ mn=Math.floor(mn/900)*900;mx=Math.max(mx,mn+1800);mx=Math.ceil(mx/900)*900;var esc=Wd/(mx-mn);
+ for(var r=0;r<rows;r++){g.appendChild(el('text',{x:4,y:T+r*LH+21,'class':'sub'},jobs[r]));
+  g.appendChild(el('line',{x1:L,y1:T+r*LH+LH,x2:L+Wd,y2:T+r*LH+LH,stroke:'var(--bd)'}))}
+ var passo=(mx-mn)>6*3600?3600:(mx-mn)>2*3600?1800:600;
+ for(var t=Math.ceil(mn/passo)*passo;t<=mx;t+=passo){var xx=L+(t-mn)*esc;
+  g.appendChild(el('line',{x1:xx,y1:T,x2:xx,y2:T+rows*LH,stroke:'var(--bd)','stroke-dasharray':'2 3'}));
+  g.appendChild(el('text',{x:xx,y:T+rows*LH+16,'class':'sub','text-anchor':'middle'},hm(t)))}
+ for(var k=0;k<barras.length;k++){var br=barras[k],ri=jobs.indexOf(br.job);if(ri<0){continue}
+  var s2=ep(br.inicio),f2=ep(br.fim),w=Math.max(3,(f2-s2)*esc),st=br.status==='BLOQUEADO_JANELA'?'BLOQUEADO':br.status;
+  var rc=el('rect',{x:L+(s2-mn)*esc,y:T+ri*LH+6,width:w,height:LH-14,rx:4,fill:COR[st]||'var(--pend)','class':br.aberta?'pulsa':''});
+  rc.appendChild(el('title',{},br.job+' tentativa '+br.tentativa+': '+(ROT[st]||st)+' ('+hm(s2)+' a '+hm(f2)+')'));g.appendChild(rc);
+  if(w>26){g.appendChild(el('text',{x:L+(s2-mn)*esc+w/2,y:T+ri*LH+LH/2+4,'text-anchor':'middle',fill:'#fff','font-size':'11','font-weight':'700'},'#'+br.tentativa))}}
+ var xa=L+(a-mn)*esc;g.appendChild(el('line',{x1:xa,y1:T,x2:xa,y2:T+rows*LH,stroke:'var(--run)','stroke-width':2}));
+ g.appendChild(el('text',{x:xa,y:T+rows*LH+16,'class':'est','text-anchor':'middle',fill:'var(--run)'},'agora'))}
+function desenhaGrade(hist,nos){var box=document.getElementById('grade');limpa(box);
+ var dias=[],vistos={},m={};for(var i=0;i<hist.length;i++){var h=hist[i];if(!vistos[h.dia]){vistos[h.dia]=1;dias.push(h.dia)}m[h.job+'|'+h.dia]=h.ok}
+ dias.sort();if(!dias.length){box.textContent='Sem histórico ainda.';return}
+ var t=document.createElement('table'),hd=t.insertRow(-1),c0=document.createElement('th');c0.className='job';hd.appendChild(c0);
+ for(var d=0;d<dias.length;d++){var th=document.createElement('th');th.textContent=dias[d].slice(8)+'/'+dias[d].slice(5,7);hd.appendChild(th)}
+ for(var j=0;j<nos.length;j++){var tr=t.insertRow(-1),cj=tr.insertCell(-1);cj.className='job';cj.textContent=nos[j].job;
+  for(var d2=0;d2<dias.length;d2++){var c=tr.insertCell(-1),v=m[nos[j].job+'|'+dias[d2]];c.className='c';
+   if(v===undefined){c.style.background='transparent';c.style.color='var(--mut)';c.textContent='-';c.title=dias[d2]+': sem execução'}
+   else{c.style.background=v?'var(--ok)':'var(--fail)';c.textContent=v?'✓':'✗';c.title=dias[d2]+': '+(v?'concluído':'não concluído')}}}
+ box.appendChild(t)}
+function legenda(){var k=['SUCESSO','EM_EXECUCAO','AGUARDANDO_RETENTATIVA','FALHA','BLOQUEADO','PENDENTE'],h='';
+ for(var i=0;i<k.length;i++){h+='<span><i style="background:'+COR[k[i]]+'"></i>'+ROT[k[i]]+'</span>'}document.getElementById('leg').innerHTML=h}
+function pinta(e){document.getElementById('dia').textContent='Ciclo de '+e.dia.slice(8)+'/'+e.dia.slice(5,7)+'/'+e.dia.slice(0,4);
+ var r=e.resumo,t='';if(r.concluido){t='Cadeia concluída'}else if(r.restante_s!==null&&r.previsao_fim){t='Faltam ~'+dur(r.restante_s)+' (previsão de término '+hm(ep(r.previsao_fim))+')'}else{t='Sem estimativa completa (poucos dados históricos)'}
+ document.getElementById('resumo').textContent=t;desenhaDag(e.nos);desenhaGantt(e.barras,e.agora,e.nos);desenhaGrade(e.historico,e.nos);
+ document.getElementById('atual').textContent='Atualizado às '+hm(ep(e.agora))+':'+('0'+(ep(e.agora)%60)).slice(-2)}
+function busca(){var x=new XMLHttpRequest();x.open('GET','/api/estado?_='+new Date().getTime());
+ x.onreadystatechange=function(){if(x.readyState!==4){return}var av=document.getElementById('aviso');
+  if(x.status===200){av.style.display='none';try{pinta(JSON.parse(x.responseText))}catch(err){av.textContent='Erro ao desenhar: '+err;av.style.display='block'}}
+  else{var m='Sem conexão com o painel';try{m=JSON.parse(x.responseText).erro||m}catch(e2){}av.textContent='Falha ao atualizar: '+m;av.style.display='block'}};x.send()}
+legenda();busca();setInterval(busca,__ATUALIZA__);
+</script></body></html>
+"""
+
+
+def cmd_painel(argv):
+    """Sobe um servidor HTTP local, somente leitura, com o grafo da cadeia em
+    tempo real. Padrao: so aceita conexoes da propria maquina (127.0.0.1)."""
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    host, porta = "127.0.0.1", 8080
+    i = 0
+    while i < len(argv):
+        if argv[i] == "--porta" and i + 1 < len(argv):
+            porta = int(argv[i + 1]); i += 2
+        elif argv[i] == "--host" and i + 1 < len(argv):
+            host = argv[i + 1]; i += 2
+        else:
+            i += 1
+    pagina = PAINEL_HTML.replace("__ATUALIZA__", str(PAINEL_ATUALIZA_S * 1000)).encode("utf-8")
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+
+        def _enviar(self, codigo, tipo, corpo):
+            self.send_response(codigo)
+            self.send_header("Content-Type", tipo)
+            self.send_header("Content-Length", str(len(corpo)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(corpo)
+
+        def do_GET(self):
+            caminho = self.path.split("?", 1)[0]
+            if caminho == "/":
+                self._enviar(200, "text/html; charset=utf-8", pagina)
+            elif caminho == "/api/estado":
+                try:
+                    corpo = json.dumps(estado_cacheado(), ensure_ascii=False, default=str).encode("utf-8")
+                    self._enviar(200, "application/json; charset=utf-8", corpo)
+                except Exception as exc:
+                    corpo = json.dumps({"erro": str(exc)[:300]}, ensure_ascii=False).encode("utf-8")
+                    self._enviar(500, "application/json; charset=utf-8", corpo)
+            else:
+                self._enviar(404, "text/plain; charset=utf-8", b"nao encontrado")
+
+    servidor = ThreadingHTTPServer((host, porta), Handler)
+    print(f"Painel em http://{host}:{porta}/  (Ctrl+C para encerrar)")
+    if host not in ("127.0.0.1", "localhost"):
+        print("ATENCAO: o painel nao tem autenticacao. Exponha apenas na rede interna.")
+    try:
+        servidor.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        servidor.server_close()
+    return 0
+
+
 def main():
     if len(sys.argv) > 1 and sys.argv[1] == "relatorio":
         return cmd_relatorio()
+    if len(sys.argv) > 1 and sys.argv[1] == "painel":
+        return cmd_painel(sys.argv[2:])
     if len(sys.argv) > 1 and sys.argv[1] in ("intervir", "verificar", "checar_metas"):
         comando = sys.argv[1]
         if comando == "intervir":

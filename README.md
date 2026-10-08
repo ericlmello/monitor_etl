@@ -14,6 +14,7 @@ Watchdog PAI em Python 3.8 para os jobs Pentaho de carga do e-Gestao (staging, t
     py -3.8 monitor_etl.py verificar
     py -3.8 monitor_etl.py checar_metas
     py -3.8 monitor_etl.py relatorio
+    py -3.8 monitor_etl.py painel            (abre em http://127.0.0.1:8080)
 
 ## Testes
     pip install pytest psycopg2-binary oracledb

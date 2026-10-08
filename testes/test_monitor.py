@@ -115,3 +115,70 @@ def test_estimativa_restante_soma_e_incompleta(monkeypatch):
     monkeypatch.setattr(m, "estimar_duracao", lambda n: medias[n])
     assert m.estimativa_restante([{"nome": "a"}, {"nome": "b"}]) == 1800.0
     assert m.estimativa_restante([{"nome": "a"}, {"nome": "c"}]) is None
+
+
+# ---------------------------------------------------------------- painel
+def _t(job, n, ini, fim, status, cat=None):
+    return {"job": job, "tentativa": n, "inicio": ini, "fim": fim,
+            "duracao_s": (fim - ini).total_seconds(), "status": status,
+            "categoria_erro": cat, "mensagem": None}
+
+
+EST = {"staging": 3000.0, "primarias": 1200.0, "carga_diaria": 900.0, "fecha_remessa": 60.0}
+
+
+def test_painel_em_execucao_com_progresso_e_previsao():
+    ag = datetime(2026, 10, 8, 10, 0, 0)
+    ini = ag - timedelta(seconds=1500)
+    est = m.montar_estado(ag, {"staging": {"tentativa": 1, "inicio": ini, "estimada_s": 3000.0}}, [], [], EST)
+    n = {x["job"]: x for x in est["nos"]}
+    assert n["staging"]["estado"] == "EM_EXECUCAO" and n["staging"]["progresso_pct"] == 50.0
+    assert n["staging"]["restante_s"] == 1500.0
+    assert n["primarias"]["estado"] == "PENDENTE"
+    assert est["resumo"]["restante_s"] == 1500.0 + 1200 + 900 + 60
+    assert est["resumo"]["previsao_fim"] is not None
+
+
+def test_painel_aguardando_retentativa():
+    ag = datetime(2026, 10, 8, 10, 0, 0)
+    falha = _t("staging", 1, ag - timedelta(minutes=30), ag - timedelta(minutes=1), "FALHA", "TRANSITORIO")
+    run = {"staging": {"tentativa": 2, "inicio": ag - timedelta(minutes=2), "estimada_s": None}}
+    est = m.montar_estado(ag, run, [falha], [], EST)
+    assert est["nos"][0]["estado"] == "AGUARDANDO_RETENTATIVA"
+
+
+def test_painel_critico_falho_marca_seguintes_nao_executados():
+    ag = datetime(2026, 10, 8, 21, 0, 0)
+    t = [_t("staging", 1, ag - timedelta(hours=5), ag - timedelta(hours=4), "BLOQUEADO_JANELA")]
+    est = m.montar_estado(ag, {}, t, [], EST)
+    estados = [x["estado"] for x in est["nos"]]
+    assert estados == ["BLOQUEADO", "NAO_EXECUTADO", "NAO_EXECUTADO", "NAO_EXECUTADO"]
+    assert est["resumo"]["concluido"] is False
+
+
+def test_painel_concluido_e_sem_estimativa():
+    ag = datetime(2026, 10, 8, 12, 0, 0)
+    ts = [_t(j["nome"], 1, ag - timedelta(hours=3 - i), ag - timedelta(hours=2.5 - i), "SUCESSO")
+          for i, j in enumerate(m.JOBS)]
+    assert m.montar_estado(ag, {}, ts, [], EST)["resumo"]["concluido"] is True
+    sem = m.montar_estado(ag, {}, [], [], {j["nome"]: None for j in m.JOBS})
+    assert sem["resumo"]["restante_s"] is None
+
+
+def test_painel_http(monkeypatch):
+    import threading, urllib.request, socket
+    ag = datetime(2026, 10, 8, 10, 0, 0)
+    est = m.montar_estado(ag, {}, [], [], EST)
+    monkeypatch.setattr(m, "estado_cacheado", lambda: est)
+    s = socket.socket(); s.bind(("127.0.0.1", 0)); porta = s.getsockname()[1]; s.close()
+    threading.Thread(target=m.cmd_painel, args=(["--porta", str(porta)],), daemon=True).start()
+    import time as _t2
+    for _ in range(50):
+        try:
+            html = urllib.request.urlopen(f"http://127.0.0.1:{porta}/", timeout=2).read().decode("utf-8")
+            break
+        except Exception:
+            _t2.sleep(0.1)
+    assert "Monitor ETL" in html and "__ATUALIZA__" not in html
+    api = urllib.request.urlopen(f"http://127.0.0.1:{porta}/api/estado", timeout=2).read().decode("utf-8")
+    assert '"nos"' in api
