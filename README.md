@@ -5,7 +5,7 @@ Watchdog PAI em Python 3.8 para os jobs Pentaho de carga do e-Gestao (staging, t
 ## Instalacao no servidor
 1. `py -3.8 -m pip install -r requirements.txt`
 2. Edite `POSTGRES_PASSWORD` e `ORACLE_PASSWORD` no inicio do `monitor_etl.py` (no repositorio estao como placeholder).
-3. Rode `sql/001_schema_eg_monitor.sql` e depois `sql/002_estimativa_qualidade_impacto.sql` no DBeaver.
+3. Rode `sql/001_schema_eg_monitor.sql` e depois `sql/002_estimativa_qualidade_impacto.sql` e `sql/003_tendencia_sazonalidade.sql` no DBeaver.
 4. Instant Client 11.2 em `C:\oracle\instantclient_11_2`.
 
 ## Uso

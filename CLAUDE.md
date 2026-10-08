@@ -25,6 +25,9 @@ Hash: `duracao_s` com 3 casas; CHAR com `rstrip()`. A ancora (12 primeiros carac
 ## Estimativa, qualidade e impacto
 Estimativa = mediana das ultimas 30 execucoes com SUCESSO do job (minimo 3). Gravada em `execucao_atual` (duracao_estimada_s, previsao_fim) e logada. Views `vw_qualidade_job` e `vw_erro_impacto` em sql/002; `relatorio` as imprime.
 
+## Sazonalidade, tendencia e previsao
+sql/003: `vw_qualidade_diaria`, `vw_qualidade_faixa_mes` (inicio/meio/fim do mes), `vw_tendencia_qualidade` (regressao linear de 60 dias; SEM_BASE com menos de 10 dias). Previsao simples, nao e modelo de ML.
+
 ## Subcomandos
 `py -3.8 monitor_etl.py` | `intervir` | `verificar` | `checar_metas` | `relatorio`
 

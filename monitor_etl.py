@@ -911,18 +911,20 @@ def _imprimir_tabela(titulo, cols, linhas):
 def cmd_relatorio():
     """Estimativa de duracao por job, qualidade e frequencia de erros x impacto
     (ultimos 30 dias). Le as views eg_monitor.vw_qualidade_job e vw_erro_impacto
-    (criadas por sql/002)."""
+    (sql/002) e vw_qualidade_faixa_mes, vw_tendencia_qualidade (sql/003)."""
     print("== Duracao estimada por job (mediana das ultimas execucoes com sucesso) ==")
     for j in JOBS:
         d, n = estimar_duracao(j["nome"])
         print(f"{j['nome']:<15} {formatar_duracao(d)}" + (f"  (n={n})" if d else f"  (n={n})"))
     for titulo, view in (("Qualidade por job (30 dias)", "vw_qualidade_job"),
-                         ("Frequencia de erros x impacto (30 dias)", "vw_erro_impacto")):
+                         ("Frequencia de erros x impacto (30 dias)", "vw_erro_impacto"),
+                         ("Qualidade e erros por faixa do mes (180 dias)", "vw_qualidade_faixa_mes"),
+                         ("Tendencia e previsao (60 dias)", "vw_tendencia_qualidade")):
         try:
             cols, linhas = _consultar_view(f"SELECT * FROM eg_monitor.{view}")
             _imprimir_tabela(titulo, cols, linhas)
         except Exception as exc:
-            print(f"\n{titulo}: indisponivel ({exc}). Rode sql/002 no DBeaver.", file=sys.stderr)
+            print(f"\n{titulo}: indisponivel ({exc}). Rode sql/002 e sql/003 no DBeaver.", file=sys.stderr)
     return 0
 
 
